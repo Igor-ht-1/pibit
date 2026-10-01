@@ -3,12 +3,13 @@
 # ETL Lattes (HTML salvo do navegador) -> PESQUISADORES / ATIVIDADES /
 #                                          PARTICIPACAO / VINCULOS
 #
-# Uso:
-#   1) Coloque os .html dos currículos em ./lattes/
-#   2) install.packages(c("xml2","stringi","digest","DBI","RSQLite"))
-#   3) Rscript etl_lattes.R
+# Uso (nenhum caminho precisa ser alterado):
+#   1) Baixe/clone o repositório e mantenha os .html dos currículos em ./dados/
+#   2) Rode:  Rscript ETL.R      (ou abra no RStudio e clique em "Source")
 #
-# Saídas (em ./saida/): pesquisa.sqlite, CSVs das 4 tabelas e carga.sql
+# Saídas:
+#   ./carga.sql           -> mesmo nível do script (para carregar no SQL)
+#   ./saida/              -> CSVs das 4 tabelas + pesquisa.sqlite
 #
 # Convenções adotadas (ajuste na seção 1 se necessário):
 #   - PARTICIPACAO = autoria/inventoria (artigo, livro, capítulo, congresso,
@@ -20,17 +21,42 @@
 #          atividades = A+hash (determinísticos: reexecutar não duplica).
 # =============================================================================
 
+# ----------------------------------------------------------------------------
+# 0. PACOTES (instala sozinho o que faltar) E PASTA DO SCRIPT
+# ----------------------------------------------------------------------------
+PACOTES <- c("xml2", "stringi", "digest", "DBI", "RSQLite")
+faltam  <- PACOTES[!vapply(PACOTES, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltam)) install.packages(faltam, repos = "https://cloud.r-project.org")
+
 suppressPackageStartupMessages({
   library(xml2); library(stringi); library(digest); library(DBI)
 })
 
+# Descobre a pasta onde o script está, em qualquer forma de execução
+# (Rscript, source() ou RStudio). Último recurso: pasta de trabalho atual.
+dir_script <- function() {
+  args <- commandArgs(trailingOnly = FALSE)
+  f <- sub("^--file=", "", args[grepl("^--file=", args)])
+  if (length(f)) return(dirname(normalizePath(f[1], winslash = "/")))
+  of <- sys.frames()[[1]]$ofile
+  if (!is.null(of)) return(dirname(normalizePath(of, winslash = "/")))
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p)) return(dirname(normalizePath(p, winslash = "/")))
+  }
+  normalizePath(getwd(), winslash = "/")
+}
+
 # ----------------------------------------------------------------------------
 # 1. CONFIGURAÇÃO
 # ----------------------------------------------------------------------------
-DIR_LATTES       <- "C:/Users/Aluno/Desktop/pibit-main/pibit-main/dados"
-DIR_SAIDA        <- "C:/Users/Aluno/Desktop/pibit-main/pibit-main"
-GRAVAR_SQLITE    <- TRUE            # grava também em SQLite (requer RSQLite)
+DIR_BASE         <- dir_script()
+DIR_LATTES       <- file.path(DIR_BASE, "dados")      # HTMLs de entrada
+DIR_SAIDA        <- file.path(DIR_BASE, "saida")      # CSVs + SQLite
+ARQ_SQL          <- file.path(DIR_BASE, "carga.sql")  # fica junto do código
 ARQ_SQLITE       <- file.path(DIR_SAIDA, "pesquisa.sqlite")
+
+GRAVAR_SQLITE    <- TRUE            # grava também em SQLite (requer RSQLite)
 INCLUIR_EXTERNOS <- FALSE           # TRUE = coautores/orientandos viram pesquisadores tipo 'Externo'
 P_INICIO         <- 6L              # primeiro id P### (P001-P005 são os exemplos)
 PESO_PADRAO      <- 1.0
@@ -550,8 +576,13 @@ anexar <- function(con, tab, df, chave) {
 # ----------------------------------------------------------------------------
 # 7. EXECUÇÃO
 # ----------------------------------------------------------------------------
-arquivos <- sort(list.files(DIR_LATTES, pattern = "\\.html?$", full.names = TRUE, ignore.case = TRUE))
-if (!length(arquivos)) stop("Nenhum .html encontrado em '", DIR_LATTES, "/'")
+if (!dir.exists(DIR_LATTES))
+  stop("Pasta de entrada não encontrada: ", DIR_LATTES,
+       "\nCrie a pasta 'dados' ao lado do ETL.R e coloque os .html dos currículos nela.")
+
+arquivos <- sort(list.files(DIR_LATTES, pattern = "\\.html?$",
+                            full.names = TRUE, ignore.case = TRUE))
+if (!length(arquivos)) stop("Nenhum .html encontrado em: ", DIR_LATTES)
 dir.create(DIR_SAIDA, showWarnings = FALSE, recursive = TRUE)
 
 message("Lendo ", length(arquivos), " currículo(s)...")
@@ -566,20 +597,21 @@ regs   <- unlist(lapply(seq_along(docs), function(i) {
 tab <- montar_tabelas(owners, regs)
 if (tab$descartados) message(tab$descartados, " registros descartados (sem título ou ano).")
 
+# CSVs -> ./saida/
 for (t in c("PESQUISADORES", "ATIVIDADES", "PARTICIPACAO", "VINCULOS"))
   write.csv(tab[[t]], file.path(DIR_SAIDA, paste0(t, ".csv")),
             row.names = FALSE, na = "", fileEncoding = "UTF-8")
 
-con_sql <- file(file.path(DIR_SAIDA, "carga.sql"), "w", encoding = "UTF-8")
+# carga.sql -> mesmo nível do script
+con_sql <- file(ARQ_SQL, "w", encoding = "UTF-8")
 writeLines(c(DDL, ""), con_sql, sep = ";\n")
 for (t in c("PESQUISADORES", "ATIVIDADES", "PARTICIPACAO", "VINCULOS"))
   writeLines(gerar_insert(t, tab[[t]]), con_sql, sep = "\n")
 close(con_sql)
 
+# SQLite -> ./saida/
 if (GRAVAR_SQLITE) {
-  if (!requireNamespace("RSQLite", quietly = TRUE)) stop("Instale o RSQLite ou use GRAVAR_SQLITE <- FALSE")
   con <- dbConnect(RSQLite::SQLite(), ARQ_SQLITE)
-  on.exit(dbDisconnect(con), add = TRUE)
   dbExecute(con, "PRAGMA foreign_keys = ON")
   for (q in DDL) dbExecute(con, q)
   n <- c(
@@ -587,9 +619,12 @@ if (GRAVAR_SQLITE) {
     ATIVIDADES    = anexar(con, "ATIVIDADES",    tab$ATIVIDADES,    "id_atividade"),
     PARTICIPACAO  = anexar(con, "PARTICIPACAO",  tab$PARTICIPACAO,  c("id_atividade", "id_pesquisador")),
     VINCULOS      = anexar(con, "VINCULOS",      tab$VINCULOS,      c("id_atividade", "id_pesquisador", "papel")))
+  dbDisconnect(con)
   message("\nLinhas novas gravadas no SQLite:"); print(n)
 }
 
 message("\nAtividades por tipo:"); print(table(tab$ATIVIDADES$tipo))
-message("Pronto. Arquivos em ./", DIR_SAIDA, "/")
+message("\nPronto!")
+message("  carga.sql  : ", ARQ_SQL)
+message("  CSVs/SQLite: ", DIR_SAIDA)
 
